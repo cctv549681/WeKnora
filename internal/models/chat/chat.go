@@ -103,8 +103,10 @@ type ChatConfig struct {
 	BaseURL   string
 	ModelName string
 	APIKey    string
-	ModelID   string
-	Provider  string
+	// FallbackKeys 是备用 API Key 列表，当主 Key 限流或配额耗尽时按序轮转重试。
+	FallbackKeys []string
+	ModelID      string
+	Provider     string
 	// MaxConcurrency caps concurrent background calls to this model; 0 falls
 	// back to the process-wide default (see limiter.GateN).
 	MaxConcurrency int
@@ -126,6 +128,7 @@ func ConfigFromModel(m *types.Model, appID, appSecret string) *ChatConfig {
 	return &ChatConfig{
 		ModelID:        m.ID,
 		APIKey:         m.Parameters.APIKey,
+		FallbackKeys:   m.Parameters.FallbackKeys,
 		BaseURL:        m.Parameters.BaseURL,
 		ModelName:      m.Name,
 		Source:         m.Source,

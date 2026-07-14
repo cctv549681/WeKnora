@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,9 +27,11 @@ type RemoteAPIChat struct {
 	modelID   string
 	baseURL   string
 	apiKey    string
-	provider  provider.ProviderName
-	appID     string
-	appSecret string
+	// fallbackKeys 是备用 API Key 列表，当主 Key 因限流（429）或配额耗尽时按序轮转重试。
+	fallbackKeys []string
+	provider     provider.ProviderName
+	appID        string
+	appSecret    string
 	// customHeaders 为用户在模型配置中指定的自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
 	customHeaders map[string]string
 
@@ -102,6 +105,7 @@ func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
 		modelID:          chatConfig.ModelID,
 		baseURL:          chatConfig.BaseURL,
 		apiKey:           apiKey,
+		fallbackKeys:     chatConfig.FallbackKeys,
 		provider:         providerName,
 		appID:            chatConfig.AppID,
 		appSecret:        chatConfig.AppSecret,
@@ -114,6 +118,65 @@ func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
 // authCreds bundles the credentials passed to the adapter's Auth method.
 func (c *RemoteAPIChat) authCreds() authCreds {
 	return authCreds{APIKey: c.apiKey, AppID: c.appID, AppSecret: c.appSecret}
+}
+
+// authCredsForKey 与 authCreds 相同，但使用指定的 apiKey（用于 fallback key 轮转时的 raw-HTTP 鉴权）。
+func (c *RemoteAPIChat) authCredsForKey(key string) authCreds {
+	return authCreds{APIKey: key, AppID: c.appID, AppSecret: c.appSecret}
+}
+
+// allAPIKeys 返回可用的 API Key 列表：主 Key 在前，非空的备用 Key 依次追加。
+// 始终至少返回一个元素（主 Key，可能为空字符串），以保持原有行为。
+func (c *RemoteAPIChat) allAPIKeys() []string {
+	keys := make([]string, 0, 1+len(c.fallbackKeys))
+	keys = append(keys, c.apiKey)
+	for _, fk := range c.fallbackKeys {
+		if fk != "" {
+			keys = append(keys, fk)
+		}
+	}
+	return keys
+}
+
+// clientForKey 为指定 apiKey 返回 openai.Client。
+// ki==0 时复用已初始化的 c.client，避免不必要的对象分配；
+// ki>0 时（fallback key）构造新 client，复用当前实例的 baseURL 和 customHeaders 配置。
+func (c *RemoteAPIChat) clientForKey(key string, ki int) *openai.Client {
+	if ki == 0 {
+		return c.client
+	}
+	var cfg openai.ClientConfig
+	if c.provider == provider.ProviderAzureOpenAI {
+		cfg = openai.DefaultAzureConfig(key, c.baseURL)
+		cfg.AzureModelMapperFunc = func(model string) string { return model }
+	} else {
+		cfg = openai.DefaultConfig(key)
+		if c.baseURL != "" {
+			cfg.BaseURL = c.baseURL
+		}
+	}
+	if len(c.customHeaders) > 0 {
+		cfg.HTTPClient = secutils.WrapHTTPClientWithHeaders(nil, c.customHeaders)
+	}
+	return openai.NewClientWithConfig(cfg)
+}
+
+// isRateLimitError 判断 err 是否为限流 / 配额耗尽类错误（HTTP 429 或常见错误消息关键词）。
+// 只有此类错误才触发 fallback key 轮转；其他错误直接透出，不做轮转。
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatusCode == http.StatusTooManyRequests
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "429") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "quota exceeded") ||
+		strings.Contains(msg, "insufficient_quota") ||
+		strings.Contains(msg, "too many requests")
 }
 
 // shapedRequest builds the standard request and applies the adapter's message
@@ -172,35 +235,61 @@ func (c *RemoteAPIChat) Chat(ctx context.Context, messages []Message, opts *Chat
 	if err != nil {
 		return nil, err
 	}
-	if useRawHTTP {
-		return c.chatWithRawHTTP(timeoutCtx, endpoint, body)
-	}
 
-	req := *(body.(*openai.ChatCompletionRequest))
-	c.logRequest(timeoutCtx, req, false)
-	resp, err := c.client.CreateChatCompletion(timeoutCtx, req)
-	if err != nil {
-		if isMultimodalNotSupportedError(err) {
-			logger.Warnf(timeoutCtx, "[LLM Request] Model %s does not support multimodal, retrying without images", c.modelName)
-			cleaned := stripImagesFromMessages(messages)
-			req = c.shapedRequest(cleaned, opts, false)
-			resp, err = c.client.CreateChatCompletion(timeoutCtx, req)
+	keys := c.allAPIKeys()
+	var lastErr error
+	for ki, key := range keys {
+		if useRawHTTP {
+			result, err := c.chatWithRawHTTP(timeoutCtx, endpoint, body, key)
+			if err == nil {
+				return result, nil
+			}
+			lastErr = err
+		} else {
+			req := *(body.(*openai.ChatCompletionRequest))
+			if ki == 0 {
+				c.logRequest(timeoutCtx, req, false)
+			}
+			client := c.clientForKey(key, ki)
+			resp, err := client.CreateChatCompletion(timeoutCtx, req)
+			if err != nil {
+				if isMultimodalNotSupportedError(err) {
+					logger.Warnf(timeoutCtx, "[LLM Request] Model %s does not support multimodal, retrying without images", c.modelName)
+					cleaned := stripImagesFromMessages(messages)
+					req = c.shapedRequest(cleaned, opts, false)
+					resp, err = client.CreateChatCompletion(timeoutCtx, req)
+				}
+				if err != nil {
+					lastErr = err
+					if !isRateLimitError(err) {
+						return nil, fmt.Errorf("create chat completion: %w", err)
+					}
+					if ki < len(keys)-1 {
+						logger.Warnf(timeoutCtx, "[LLM] model=%s key[%d] rate limited, rotating to fallback key[%d]", c.modelName, ki, ki+1)
+					}
+					continue
+				}
+			}
+			result, err := c.parseCompletionResponse(&resp)
+			if err != nil {
+				return nil, err
+			}
+			logUsage(timeoutCtx, c.modelName, &result.Usage)
+			return result, nil
 		}
-		if err != nil {
-			return nil, fmt.Errorf("create chat completion: %w", err)
-		}
-	}
 
-	result, err := c.parseCompletionResponse(&resp)
-	if err != nil {
-		return nil, err
+		if !isRateLimitError(lastErr) {
+			return nil, fmt.Errorf("create chat completion: %w", lastErr)
+		}
+		if ki < len(keys)-1 {
+			logger.Warnf(timeoutCtx, "[LLM] model=%s key[%d] rate limited (raw http), rotating to fallback key[%d]", c.modelName, ki, ki+1)
+		}
 	}
-	logUsage(timeoutCtx, c.modelName, &result.Usage)
-	return result, nil
+	return nil, fmt.Errorf("create chat completion: %w", lastErr)
 }
 
 // chatWithRawHTTP 使用原始 HTTP 请求进行聊天（供自定义请求使用）
-func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, customReq any) (*types.ChatResponse, error) {
+func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, customReq any, apiKey string) (*types.ChatResponse, error) {
 	jsonData, err := json.Marshal(customReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -221,7 +310,7 @@ func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, cu
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	c.adapter.Auth(httpReq, c.authCreds(), jsonData)
+	c.adapter.Auth(httpReq, c.authCredsForKey(apiKey), jsonData)
 
 	// 注入用户自定义 header（保留头会在工具内部自动跳过）
 	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
@@ -270,9 +359,26 @@ func (c *RemoteAPIChat) ChatStream(ctx context.Context, messages []Message, opts
 		cancel()
 		return nil, err
 	}
+
+	keys := c.allAPIKeys()
+
 	if useRawHTTP {
-		ch, err := c.chatStreamWithRawHTTP(timeoutCtx, endpoint, body)
-		return wrapStreamCancel(ch, err, cancel)
+		var ch <-chan types.StreamResponse
+		var lastErr error
+		for ki, key := range keys {
+			ch, lastErr = c.chatStreamWithRawHTTP(timeoutCtx, endpoint, body, key)
+			if lastErr == nil {
+				return wrapStreamCancel(ch, nil, cancel)
+			}
+			if !isRateLimitError(lastErr) {
+				break
+			}
+			if ki < len(keys)-1 {
+				logger.Warnf(timeoutCtx, "[LLM Stream] model=%s key[%d] rate limited (raw http), rotating to fallback key[%d]", c.modelName, ki, ki+1)
+			}
+		}
+		cancel()
+		return nil, lastErr
 	}
 
 	req := *(body.(*openai.ChatCompletionRequest))
@@ -285,19 +391,36 @@ func (c *RemoteAPIChat) ChatStream(ctx context.Context, messages []Message, opts
 
 	streamChan := make(chan types.StreamResponse)
 
-	stream, err := c.client.CreateChatCompletionStream(timeoutCtx, req)
-	if err != nil {
-		if isMultimodalNotSupportedError(err) {
+	// 在流建立阶段尝试 key 轮转（流中途不能换 key，只能在 CreateChatCompletionStream 前做）
+	var stream *openai.ChatCompletionStream
+	var lastErr error
+	for ki, key := range keys {
+		client := c.clientForKey(key, ki)
+		tryReq := req
+		stream, lastErr = client.CreateChatCompletionStream(timeoutCtx, tryReq)
+		if lastErr == nil {
+			break
+		}
+		if isMultimodalNotSupportedError(lastErr) && ki == 0 {
 			logger.Warnf(timeoutCtx, "[LLM Stream] Model %s does not support multimodal, retrying without images", c.modelName)
 			cleaned := stripImagesFromMessages(messages)
-			req = c.shapedRequest(cleaned, opts, true)
-			stream, err = c.client.CreateChatCompletionStream(timeoutCtx, req)
+			tryReq = c.shapedRequest(cleaned, opts, true)
+			stream, lastErr = client.CreateChatCompletionStream(timeoutCtx, tryReq)
+			if lastErr == nil {
+				break
+			}
 		}
-		if err != nil {
-			cancel()
-			close(streamChan)
-			return nil, fmt.Errorf("create chat completion stream: %w", err)
+		if !isRateLimitError(lastErr) {
+			break
 		}
+		if ki < len(keys)-1 {
+			logger.Warnf(timeoutCtx, "[LLM Stream] model=%s key[%d] rate limited, rotating to fallback key[%d]", c.modelName, ki, ki+1)
+		}
+	}
+	if lastErr != nil {
+		cancel()
+		close(streamChan)
+		return nil, fmt.Errorf("create chat completion stream: %w", lastErr)
 	}
 
 	go func() {
@@ -330,7 +453,7 @@ func wrapStreamCancel(in <-chan types.StreamResponse, err error, cancel context.
 }
 
 // chatStreamWithRawHTTP 使用原始 HTTP 请求进行流式聊天
-func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint string, customReq any) (<-chan types.StreamResponse, error) {
+func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint string, customReq any, apiKey string) (<-chan types.StreamResponse, error) {
 	jsonData, err := json.Marshal(customReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -355,7 +478,7 @@ func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint stri
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	c.adapter.Auth(httpReq, c.authCreds(), jsonData)
+	c.adapter.Auth(httpReq, c.authCredsForKey(apiKey), jsonData)
 	httpReq.Header.Set("Accept", "text/event-stream")
 
 	// 注入用户自定义 header（保留头会在工具内部自动跳过）

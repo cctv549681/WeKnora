@@ -39,6 +39,11 @@ builtin_models: []
 #       base_url: ${LLM_BASE_URL}
 #       api_key: ${LLM_API_KEY}
 #       provider: ${LLM_PROVIDER}  # openai | generic | aliyun | moonshot | ...
+#       # Optional: rotate to a backup key when the primary is rate-limited (HTTP 429)
+#       # or quota-exhausted. Keys are tried in order; the first success wins.
+#       # fallback_keys:
+#       #   - ${LLM_API_KEY_FALLBACK_1}
+#       #   - ${LLM_API_KEY_FALLBACK_2}
 #
 #   - id: builtin-embedding-default
 #     type: Embedding

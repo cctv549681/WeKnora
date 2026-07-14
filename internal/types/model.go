@@ -63,8 +63,15 @@ type EmbeddingParameters struct {
 }
 
 type ModelParameters struct {
-	BaseURL             string              `yaml:"base_url"             json:"base_url"`
-	APIKey              string              `yaml:"api_key"              json:"api_key"`
+	BaseURL  string `yaml:"base_url" json:"base_url"`
+	APIKey   string `yaml:"api_key"  json:"api_key"`
+	// FallbackKeys 是备用 API Key 列表，当主 Key 因限流（429）或配额耗尽而调用失败时，
+	// 运行时会按顺序轮转到下一个 Key 重试。每个 Key 均以与 APIKey 相同的 AES-256 方式加密存储。
+	// 在 builtin_models.yaml 里可通过 YAML 列表引用环境变量：
+	//   fallback_keys:
+	//     - ${CHAT_API_KEY_FALLBACK_1}
+	//     - ${CHAT_API_KEY_FALLBACK_2}
+	FallbackKeys        []string            `yaml:"fallback_keys,omitempty" json:"fallback_keys,omitempty"`
 	InterfaceType       string              `yaml:"interface_type"       json:"interface_type"`
 	EmbeddingParameters EmbeddingParameters `yaml:"embedding_parameters" json:"embedding_parameters"`
 	ParameterSize       string              `yaml:"parameter_size"       json:"parameter_size"` // Ollama model parameter size (e.g., "7B", "13B", "70B")
@@ -152,7 +159,7 @@ type Model struct {
 }
 
 // Value implements the driver.Valuer interface, used to convert ModelParameters to database value.
-// Encrypts APIKey and AppSecret before persisting to database (value receiver = no memory pollution).
+// Encrypts APIKey, FallbackKeys, and AppSecret before persisting to database (value receiver = no memory pollution).
 func (c ModelParameters) Value() (driver.Value, error) {
 	if key := utils.GetAESKey(); key != nil {
 		if c.APIKey != "" {
@@ -165,12 +172,20 @@ func (c ModelParameters) Value() (driver.Value, error) {
 				c.AppSecret = encrypted
 			}
 		}
+		// 逐一加密每个备用 Key
+		for i, fk := range c.FallbackKeys {
+			if fk != "" {
+				if encrypted, err := utils.EncryptAESGCM(fk, key); err == nil {
+					c.FallbackKeys[i] = encrypted
+				}
+			}
+		}
 	}
 	return json.Marshal(c)
 }
 
 // Scan implements the sql.Scanner interface, used to convert database value to ModelParameters.
-// Decrypts APIKey and AppSecret after loading from database; legacy plaintext is returned as-is.
+// Decrypts APIKey, FallbackKeys, and AppSecret after loading from database; legacy plaintext is returned as-is.
 func (c *ModelParameters) Scan(value interface{}) error {
 	if value == nil {
 		return nil
@@ -196,6 +211,16 @@ func (c *ModelParameters) Scan(value interface{}) error {
 	} else {
 		log.Printf("[crypto] model parameters app_secret: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
 		c.AppSecret = ""
+	}
+	// 逐一解密每个备用 Key；解密失败的 Key 清空（而非保留密文），
+	// 避免密文被当作明文 Key 传出去触发更难排查的鉴权错误。
+	for i, fk := range c.FallbackKeys {
+		if plain, ok := utils.DecryptStoredSecretLenient(fk); ok {
+			c.FallbackKeys[i] = plain
+		} else {
+			log.Printf("[crypto] model parameters fallback_keys[%d]: decrypt failed, clearing", i)
+			c.FallbackKeys[i] = ""
+		}
 	}
 	return nil
 }
