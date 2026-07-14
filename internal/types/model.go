@@ -172,11 +172,19 @@ func (c ModelParameters) Value() (driver.Value, error) {
 				c.AppSecret = encrypted
 			}
 		}
-		// 逐一加密每个备用 Key
-		for i, fk := range c.FallbackKeys {
-			if fk != "" {
-				if encrypted, err := utils.EncryptAESGCM(fk, key); err == nil {
-					c.FallbackKeys[i] = encrypted
+		// 逐一加密每个备用 Key。
+		// 注意：value receiver 的 FallbackKeys 只复制了 slice header，底层数组与调用方共享。
+		// 必须先深拷贝，否则 c.FallbackKeys[i] = encrypted 会写穿到原始对象，
+		// 导致调用方的明文 Key 被密文覆盖。
+		if len(c.FallbackKeys) > 0 {
+			copied := make([]string, len(c.FallbackKeys))
+			copy(copied, c.FallbackKeys)
+			c.FallbackKeys = copied
+			for i, fk := range c.FallbackKeys {
+				if fk != "" {
+					if encrypted, err := utils.EncryptAESGCM(fk, key); err == nil {
+						c.FallbackKeys[i] = encrypted
+					}
 				}
 			}
 		}

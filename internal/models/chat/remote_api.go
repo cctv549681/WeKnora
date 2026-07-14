@@ -30,8 +30,10 @@ type RemoteAPIChat struct {
 	// fallbackKeys 是备用 API Key 列表，当主 Key 因限流（429）或配额耗尽时按序轮转重试。
 	fallbackKeys []string
 	provider     provider.ProviderName
-	appID        string
-	appSecret    string
+	// apiVersion 仅 Azure OpenAI 使用，构造 fallback client 时需要与主 client 保持一致。
+	apiVersion string
+	appID      string
+	appSecret  string
 	// customHeaders 为用户在模型配置中指定的自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
 	customHeaders map[string]string
 
@@ -107,6 +109,7 @@ func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
 		apiKey:           apiKey,
 		fallbackKeys:     chatConfig.FallbackKeys,
 		provider:         providerName,
+		apiVersion:       config.APIVersion, // 仅 Azure 有值，其他 provider 为空字符串
 		appID:            chatConfig.AppID,
 		appSecret:        chatConfig.AppSecret,
 		customHeaders:    chatConfig.CustomHeaders,
@@ -140,7 +143,7 @@ func (c *RemoteAPIChat) allAPIKeys() []string {
 
 // clientForKey 为指定 apiKey 返回 openai.Client。
 // ki==0 时复用已初始化的 c.client，避免不必要的对象分配；
-// ki>0 时（fallback key）构造新 client，复用当前实例的 baseURL 和 customHeaders 配置。
+// ki>0 时（fallback key）构造新 client，复用当前实例的 baseURL、customHeaders、apiVersion 配置。
 func (c *RemoteAPIChat) clientForKey(key string, ki int) *openai.Client {
 	if ki == 0 {
 		return c.client
@@ -149,6 +152,9 @@ func (c *RemoteAPIChat) clientForKey(key string, ki int) *openai.Client {
 	if c.provider == provider.ProviderAzureOpenAI {
 		cfg = openai.DefaultAzureConfig(key, c.baseURL)
 		cfg.AzureModelMapperFunc = func(model string) string { return model }
+		if c.apiVersion != "" {
+			cfg.APIVersion = c.apiVersion
+		}
 	} else {
 		cfg = openai.DefaultConfig(key)
 		if c.baseURL != "" {
